@@ -3,7 +3,7 @@
 PhotoStamper.py — Универсальный инструмент штамповки:
 1. print_glyph() — наложение CJK-глифа в левый нижний угол.
 2. print_stamp() — наложение даты, координат и адреса в правый нижний угол.
-Поддерживает беспотерьную врезку через jpegtran и защиту от спуфинга РЭБ.
+Поддерживает беспотерьную гибридную врезку (Lossless MCU Blend) через jpegtran.
 """
 
 import os
@@ -17,7 +17,7 @@ import tempfile
 import subprocess
 import urllib.request
 from datetime import datetime
-from PIL import Image, ImageOps, ImageDraw, ImageFont
+from PIL import Image, ImageOps, ImageDraw, ImageFont, JpegImagePlugin
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -98,7 +98,7 @@ def reverse_geocode(lat, lon):
     if cache_key in GEO_CACHE: return GEO_CACHE[cache_key]
 
     url = f"https://nominatim.openstreetmap.org/reverse?lat={lat}&lon={lon}&format=json&accept-language=ru"
-    req = urllib.request.Request(url, headers={"User-Agent": "PhotoStamper/2.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "PhotoStamper/2.1"})
     lines = []
     try:
         with urllib.request.urlopen(req, timeout=3) as resp:
@@ -118,39 +118,87 @@ def reverse_geocode(lat, lon):
     GEO_CACHE[cache_key] = lines
     return lines
 
+# --- ВИЗУАЛЬНЫЙ РАЗМЕР КАДРА С УЧЁТОМ EXIF-ПОВОРОТА ---
+def get_visual_size(im):
+    w, h = im.size
+    if im.getexif().get(274, 1) in (5, 6, 7, 8):
+        w, h = h, w
+    return w, h
+
 # --- БЕСПОТЕРЬНАЯ ВРЕЗКА ЧЕРЕЗ JPEGTRAN (СЕТКА MCU 16x16) ---
 def find_jpegtran():
     return shutil.which("jpegtran") or (os.path.join(SCRIPT_DIR, "jpegtran.exe") if os.path.exists(os.path.join(SCRIPT_DIR, "jpegtran.exe")) else None)
 
 def apply_jpeg_patch_lossless(base_jpg, patch_img, x_pos, y_pos):
-    """Врезает заплатку в JPEG через jpegtran без пересжатия остального кадра."""
+    """
+    Врезает заплатку в JPEG через jpegtran без пересжатия остального кадра.
+    Вырезает оригинальный фон для соблюдения краев MCU и поддержки полупрозрачности!
+    """
     jpegtran_bin = find_jpegtran()
     if not jpegtran_bin:
-        return False  # Сигнал для fallback на Pillow
+        return False
+
+    # Проверка поворота: jpegtran работает в координатах хранения, а не визуальных.
+    # При EXIF-Orientation != 1 врезка легла бы не туда -> отдаём Pillow-режиму.
+    with Image.open(base_jpg) as bim0:
+        orient = bim0.getexif().get(274, 1)
+        img_w, img_h = get_visual_size(bim0)
+        base_sub = JpegImagePlugin.get_sampling(bim0)
+    if orient != 1 or base_sub < 0:
+        return False
 
     pw, ph = patch_img.size
-    # Выравнивание координат и размеров строго по границам MCU (кратно 16)
+    # Координаты MCU-блока, куда ляжет врезка
     x_mcu = (x_pos // 16) * 16
     y_mcu = (y_pos // 16) * 16
-    pw_mcu = ((pw + 15) // 16) * 16
-    ph_mcu = ((ph + 15) // 16) * 16
-
-    aligned_patch = Image.new("RGB", (pw_mcu, ph_mcu), "black")
-    aligned_patch.paste(patch_img, (0, 0))
+    
+    # Ширина и высота MCU-заплатки рассчитываются так, чтобы вместить весь штамп,
+    # но НЕ выходят за границы кадра (иначе jpegtran: "Invalid crop request",
+    # если размер кадра не кратен 16, например 3016 px)
+    pw_mcu = min((((x_pos + pw + 15) // 16) * 16), img_w) - x_mcu
+    ph_mcu = min((((y_pos + ph + 15) // 16) * 16), img_h) - y_mcu
+    
+    offset_x = x_pos - x_mcu
+    offset_y = y_pos - y_mcu
 
     tmp_dir = tempfile.gettempdir()
     tmp_patch = os.path.join(tmp_dir, f"patch_{os.getpid()}_{x_mcu}_{y_mcu}.jpg")
     tmp_out = os.path.join(tmp_dir, f"out_{os.getpid()}.jpg")
+    
+    main_mod = sys.modules.get('__main__')
+    debug_mode = getattr(main_mod, 'DEBUG_MODE', False) if main_mod else False
 
     try:
-        aligned_patch.save(tmp_patch, "JPEG", quality=95, subsampling="4:2:0")
+        with Image.open(base_jpg) as bim:
+            # Извлекаем оригинальный фон (поворот уже проверен: Orientation == 1)
+            bim_vis = bim.convert("RGB")
+        
+        # Вырезаем фоновый кусок строго по границам MCU
+        bg_patch = bim_vis.crop((x_mcu, y_mcu, x_mcu + pw_mcu, y_mcu + ph_mcu))
+        
+        # Накладываем нашу заплатку поверх оригинального фона
+        if patch_img.mode == "RGBA":
+            bg_patch.paste(patch_img, (offset_x, offset_y), patch_img)
+        else:
+            bg_patch.paste(patch_img, (offset_x, offset_y))
+
+        # Сохраняем гибридную заплатку СТРОГО в той же сетке, что и оригинал
+        bg_patch.save(tmp_patch, "JPEG", quality=95, subsampling=base_sub)
+        
         cmd = [jpegtran_bin, "-drop", f"+{x_mcu}+{y_mcu}", tmp_patch, "-copy", "all", "-outfile", tmp_out, base_jpg]
-        res = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if debug_mode: print(f"    [DEBUG-CMD] {' '.join(cmd)}")
+            
+        res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
         if res.returncode == 0:
-            os.replace(tmp_out, base_jpg)
+            shutil.move(tmp_out, base_jpg)
             return True
-    except Exception:
-        pass
+        else:
+            if debug_mode: print(f"    [DEBUG-JPEGTRAN FAIL] {res.stderr.strip()}")
+            return False
+    except Exception as e:
+        if debug_mode: print(f"    [DEBUG-EXC] {e}")
+        return False
     finally:
         for f in (tmp_patch, tmp_out):
             if os.path.exists(f):
@@ -161,15 +209,16 @@ def apply_jpeg_patch_lossless(base_jpg, patch_img, x_pos, y_pos):
 # =========================================================================
 # ИНТЕРФЕЙС 1: ПЕЧАТЬ ГЛИФА (ЛЕВЫЙ НИЖНИЙ УГОЛ)
 # =========================================================================
-def print_glyph(filepath, glyph):
-    """Впечатывает CJK-глиф в левый нижний угол (монолитная плашка 112x96)."""
+def print_glyph(filepath, glyph, blend=False):
+    """Впечатывает CJK-глиф в левый нижний угол."""
     abs_path = os.path.abspath(filepath)
     with Image.open(abs_path) as im:
-        w, h = im.size
+        w, h = get_visual_size(im)
 
-    # Размер плашки 112x96 (кратен 16 для MCU)
-    box_w, box_h = 112, 96
-    patch = Image.new("RGB", (box_w, box_h), "black")
+    box_w, box_h = 100, 96
+    # RGBA патч: полупрозрачный фон, если включен blend
+    bg_color = (0, 0, 0, 140) if blend else (0, 0, 0, 255)
+    patch = Image.new("RGBA", (box_w, box_h), bg_color)
     draw = ImageDraw.Draw(patch)
     font = get_cjk_font(80)
 
@@ -177,29 +226,34 @@ def print_glyph(filepath, glyph):
     gw, gh = bbox[2] - bbox[0], bbox[3] - bbox[1]
     gx = (box_w - gw) // 2 - bbox[0]
     gy = (box_h - gh) // 2 - bbox[1]
+    
+    # Обводка/тень для читаемости при полупрозрачности
+    if blend:
+        for ox, oy in [(-1,-1), (1,-1), (-1,1), (1,1), (0,-1), (0,1), (-1,0), (1,0)]:
+            draw.text((gx + ox, gy + oy), glyph, fill="black", font=font)
     draw.text((gx, gy), glyph, fill="white", font=font)
 
     x_pos = 0
     y_pos = h - box_h
 
-    # 1. Пробуем беспотерьную врезку через jpegtran
     if apply_jpeg_patch_lossless(abs_path, patch, x_pos, y_pos):
-        return True, "Lossless (MCU)"
+        return True, "Lossless (MCU Blend)" if blend else "Lossless (MCU Solid)"
 
-    # 2. Fallback на Pillow
     with Image.open(abs_path) as im:
-        raw_exif = im.getexif()
-        im_trans = ImageOps.exif_transpose(im).convert("RGB")
-        im_trans.paste(patch, (x_pos, y_pos))
+        im_t = ImageOps.exif_transpose(im)  # Orientation после поворота сбрасывается
+        out_exif = im_t.getexif()
+        im_trans = im_t.convert("RGBA")
+        im_trans.paste(patch, (x_pos, y_pos), patch)
+        im_rgb = im_trans.convert("RGB")
         tmp = f"{abs_path}.tmp_gl.jpg"
-        im_trans.save(tmp, "JPEG", quality=95, exif=raw_exif)
+        im_rgb.save(tmp, "JPEG", quality=95, exif=out_exif)
         os.replace(tmp, abs_path)
-    return True, "Pillow"
+    return True, "Pillow Blend" if blend else "Pillow Solid"
 
 # =========================================================================
 # ИНТЕРФЕЙС 2: ПЕЧАТЬ ТЕЛЕМЕТРИИ (ПРАВЫЙ НИЖНИЙ УГОЛ)
 # =========================================================================
-def print_stamp(filepath, coords=None, dt=None, fetch_address=True):
+def print_stamp(filepath, coords=None, dt=None, fetch_address=True, blend=False):
     """
     Впечатывает штамп даты/GPS/адреса в правый нижний угол.
     Поддерживает защиту от РЭБ: если передан coords, берет его вместо EXIF!
@@ -207,7 +261,7 @@ def print_stamp(filepath, coords=None, dt=None, fetch_address=True):
     abs_path = os.path.abspath(filepath)
     with Image.open(abs_path) as im:
         raw_exif = im.getexif()
-        w, h = im.size
+        w, h = get_visual_size(im)
 
     # Определение даты (переданная вручную или из EXIF)
     dt_str = dt or parse_exif_datetime(raw_exif)
@@ -219,9 +273,11 @@ def print_stamp(filepath, coords=None, dt=None, fetch_address=True):
     if coords and isinstance(coords, str):
         # Ручные координаты пользователя в обход РЭБ
         coords_str = coords.strip()
-        m = re.search(r'(\d+\.\d+)[NnSs]\s*(\d+\.\d+)[EeWw]', coords_str)
+        m = re.search(r'(\d+\.\d+)\s*([NnSs])\s*(\d+\.\d+)\s*([EeWw])', coords_str)
         if m:
-            lat, lon = float(m.group(1)), float(m.group(2))
+            lat, lon = float(m.group(1)), float(m.group(3))
+            if m.group(2) in 'Ss': lat = -lat
+            if m.group(4) in 'Ww': lon = -lon
     else:
         # Автоматические координаты из EXIF
         lat, lon = parse_exif_gps(raw_exif)
@@ -253,36 +309,39 @@ def print_stamp(filepath, coords=None, dt=None, fetch_address=True):
     max_w = max(widths) if widths else 100
     tot_h = sum(heights) + line_sp * (len(lines) - 1)
 
-    # Размеры плашки (с запасом 15px и кратностью 16)
-    patch_w = ((max_w + 30 + 15) // 16) * 16
-    patch_h = ((tot_h + 30 + 15) // 16) * 16
+    # Отступы внутри плашки
+    pad_x, pad_y = 15, 15
+    patch_w = max_w + pad_x * 2
+    patch_h = tot_h + pad_y * 2
 
-    patch = Image.new("RGB", (patch_w, patch_h), "black")
+    bg_color = (0, 0, 0, 140) if blend else (0, 0, 0, 255)
+    patch = Image.new("RGBA", (patch_w, patch_h), bg_color)
     draw = ImageDraw.Draw(patch)
 
-    curr_y = 15
+    curr_y = pad_y
     for idx, l in enumerate(lines):
-        # Рисуем контрастный текст с тенью
-        for ox, oy in [(-1,-1), (1,-1), (-1,1), (1,1)]:
-            draw.text((15 + ox, curr_y + oy), l, font=font, fill="#222222")
-        draw.text((15, curr_y), l, font=font, fill="white")
+        # Обводка/тень во все стороны для контраста на прозрачном фоне
+        for ox, oy in [(-1,-1), (1,-1), (-1,1), (1,1), (0,-1), (0,1), (-1,0), (1,0)]:
+            draw.text((pad_x + ox, curr_y + oy), l, font=font, fill="black")
+        draw.text((pad_x, curr_y), l, font=font, fill="white")
         curr_y += heights[idx] + line_sp
 
     x_pos = w - patch_w
     y_pos = h - patch_h
 
-    # 1. Пробуем Lossless врезку через jpegtran
     if apply_jpeg_patch_lossless(abs_path, patch, x_pos, y_pos):
-        return True, "Lossless (MCU)"
+        return True, "Lossless (MCU Blend)" if blend else "Lossless (MCU Solid)"
 
-    # 2. Fallback на Pillow
     with Image.open(abs_path) as im:
-        im_trans = ImageOps.exif_transpose(im).convert("RGB")
-        im_trans.paste(patch, (x_pos, y_pos))
+        im_t = ImageOps.exif_transpose(im)  # Orientation после поворота сбрасывается
+        out_exif = im_t.getexif()
+        im_trans = im_t.convert("RGBA")
+        im_trans.paste(patch, (x_pos, y_pos), patch)
+        im_rgb = im_trans.convert("RGB")
         tmp = f"{abs_path}.tmp_st.jpg"
-        im_trans.save(tmp, "JPEG", quality=95, exif=raw_exif)
+        im_rgb.save(tmp, "JPEG", quality=95, exif=out_exif)
         os.replace(tmp, abs_path)
-    return True, "Pillow"
+    return True, "Pillow Blend" if blend else "Pillow Solid"
 
 # =========================================================================
 # КОМАНДНАЯ СТРОКА (CLI) ДЛЯ РУЧНОЙ ПРОВЕРКИ
@@ -293,9 +352,16 @@ def main():
     parser.add_argument("-g", "--glyph", default=None, help="Наложить глиф в левый нижний угол (например: -g 丹)")
     parser.add_argument("-c", "--coords", nargs="?", const=True, default=None,
                         help="Наложить координаты в правый угол (из EXIF или вручную: -c '56.051N 37.493E')")
+    parser.add_argument("-b", "--blend", action="store_true", help="Сделать фон штампов полупрозрачным (вырезает фон из оригинала)")
     parser.add_argument("--no-geo", action="store_true", help="Не запрашивать адрес через сеть (защита от РЭБ)")
+    parser.add_argument("-d", "--debug", action="store_true", help="Включить отладку вызовов jpegtran")
 
     args = parser.parse_args()
+    
+    # Глобальный флаг дебага для функций
+    main_mod = sys.modules.get('__main__')
+    if main_mod:
+        setattr(main_mod, 'DEBUG_MODE', args.debug)
 
     actual_targets = args.targets if args.targets else ["."]
     files = []
@@ -319,13 +385,13 @@ def main():
 
         # 1. Печать глифа (-g)
         if args.glyph:
-            ok, mode = print_glyph(f, args.glyph)
+            ok, mode = print_glyph(f, args.glyph, blend=args.blend)
             print(f"  [GLYPH] {fname} -> [{args.glyph}] ({mode})")
 
         # 2. Печать телеметрии (-c)
         if args.coords is not None:
             c_val = None if args.coords is True else str(args.coords)
-            ok, mode = print_stamp(f, coords=c_val, fetch_address=not args.no_geo)
+            ok, mode = print_stamp(f, coords=c_val, fetch_address=not args.no_geo, blend=args.blend)
             print(f"  [STAMP] {fname} -> Координаты ({mode})")
 
 if __name__ == "__main__":
